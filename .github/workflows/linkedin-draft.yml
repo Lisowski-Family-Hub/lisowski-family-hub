@@ -1,0 +1,171 @@
+name: LinkedIn / Draft weekly posts
+
+on:
+  schedule:
+    # Sunday 21:00 UTC = 4 PM Central during daylight time.
+    - cron: '0 21 * * 0'
+  workflow_dispatch:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+
+jobs:
+  draft:
+    if: github.event_name != 'issue_comment'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: linkedin-draft
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Skip if a drafts PR is already open
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          open=$(gh pr list --label linkedin-drafts --state open --json number --jq 'length' || echo 0)
+          if [ "$open" != "0" ]; then
+            echo "A linkedin-drafts PR is already open; not drafting again."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute next week's dates
+        if: steps.guard.outputs.skip != 'true'
+        id: dates
+        run: |
+          monday=$(date -u -d 'next monday' +%F)
+          list=""
+          for i in 0 1 2 3 4; do
+            list="$list $(date -u -d "$monday + $i day" +%F)"
+          done
+          echo "monday=$monday" >> "$GITHUB_OUTPUT"
+          echo "list=${list# }" >> "$GITHUB_OUTPUT"
+
+      - name: Draft five posts with Claude
+        if: steps.guard.outputs.skip != 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: '--allowedTools "Read,Write,Glob,Grep"'
+          prompt: |
+            You are the drafting engine of a LinkedIn leadership agent. Write five
+            LinkedIn posts as draft files, one per weekday, for these dates (Monday
+            through Friday): ${{ steps.dates.outputs.list }}
+
+            First read, in this order:
+            1. linkedin-agent/profile/voice.md — write in exactly this voice.
+            2. linkedin-agent/profile/audience.md — write for exactly this audience.
+            3. linkedin-agent/profile/pillars.md — the five content pillars and their
+               weekday mapping (Mon=personal-lesson, Tue=industry-pov, Wed=team-culture,
+               Thu=contrarian-take, Fri=celebrating-others).
+            4. linkedin-agent/performance/log.md — apply every lesson recorded there.
+            5. The 10 most recent files in linkedin-agent/published/ (if any) — do not
+               repeat their topics, hooks, or structural patterns.
+
+            Then create exactly five files, linkedin-agent/drafts/<date>.md, one per
+            date above, each in this exact format:
+
+            ---
+            date: <YYYY-MM-DD>
+            pillar: <that weekday's pillar id>
+            status: draft
+            hook: "<one line: the opening angle of the post>"
+            ---
+
+            <the complete post text, ready to publish verbatim>
+
+            Hard rules for each post body:
+            - 600 to 1800 characters (the validator rejects under 100 or over 3000).
+            - The first line must earn the click on its own — no throat-clearing.
+            - Short paragraphs (1-3 sentences), generous line breaks, no markdown
+              formatting since LinkedIn renders plain text only.
+            - No hashtag walls: at most 3 hashtags, only if genuinely useful.
+            - End with a genuine question or invitation to comment.
+            - Each of the five posts must differ in topic, structure, and opening style.
+
+            Do not modify any file outside linkedin-agent/drafts/.
+
+      - name: Validate the generated drafts
+        if: steps.guard.outputs.skip != 'true'
+        run: node linkedin-agent/scripts/validate.js
+
+      - name: Open the drafts PR
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MONDAY: ${{ steps.dates.outputs.monday }}
+          REVIEWER: ${{ vars.LINKEDIN_REVIEWER || github.repository_owner }}
+        run: |
+          BRANCH="linkedin/drafts-$MONDAY"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add linkedin-agent/drafts
+          if git diff --cached --quiet; then
+            echo "::error::Claude produced no draft files; failing so this gets noticed."
+            exit 1
+          fi
+          git commit -m "LinkedIn drafts for week of $MONDAY"
+          git push -u origin "$BRANCH" --force
+          gh label create linkedin-drafts --force --color 0E8A16 \
+            --description "Weekly LinkedIn draft PRs" || true
+          gh pr create --base main --head "$BRANCH" \
+            --title "LinkedIn drafts — week of $MONDAY" \
+            --label linkedin-drafts \
+            --body "Five drafts for next week, one per weekday. **Merging this PR is the approval** — each post publishes automatically on its date at ~8 AM Central.
+
+          How to review:
+          - Edit any draft directly on this branch to tweak wording.
+          - Comment \`@claude <what to change>\` for a revision (e.g. \`@claude make Tuesday's hook punchier\`).
+          - Delete a draft file to skip that day.
+          - Close the PR unmerged to skip the whole week." || true
+          gh pr edit "$BRANCH" --add-assignee "$REVIEWER" || true
+
+      - name: Open or update an alert issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create linkedin-agent-alert --force --color D93F0B \
+            --description "LinkedIn agent needs attention" || true
+          body="The Sunday drafting workflow failed, so next week's LinkedIn drafts PR was not opened.
+
+          Run log: $RUN_URL"
+          existing=$(gh issue list --label linkedin-agent-alert --state open \
+            --search "LinkedIn drafting failed in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "LinkedIn drafting failed" \
+              --label linkedin-agent-alert --body "$body"
+          fi
+
+  revise:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@claude')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Handle the @claude revision request
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
