@@ -1,0 +1,77 @@
+name: LinkedIn / Publish
+
+on:
+  schedule:
+    # 13:10 UTC = 8:10 AM Central during daylight time (7:10 AM in winter).
+    # Weekdays only; the publisher exits cleanly when there is no draft for today.
+    - cron: '10 13 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: print the payload without calling LinkedIn'
+        type: boolean
+        default: true
+      target_date:
+        description: 'Optional YYYY-MM-DD override (defaults to today, America/Chicago)'
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: linkedin-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Publish today's approved draft
+        env:
+          LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }}
+          LINKEDIN_PERSON_URN: ${{ secrets.LINKEDIN_PERSON_URN }}
+          DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '1' || '' }}
+          TARGET_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.target_date || '' }}
+        run: node linkedin-agent/scripts/publish.js
+
+      - name: Commit the draft -> published archive move
+        run: |
+          if [ -n "$(git status --porcelain linkedin-agent)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add linkedin-agent
+            git commit -m "Archive published LinkedIn post"
+            git push origin main
+          else
+            echo "No archive changes to commit."
+          fi
+
+      - name: Open or update an alert issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create linkedin-agent-alert --force --color D93F0B \
+            --description "LinkedIn agent needs attention" || true
+          body="The scheduled LinkedIn publish failed, so today's post may not have gone out.
+
+          Run log: $RUN_URL
+
+          Common causes: expired access token (see linkedin-agent/SETUP.md to renew), a malformed draft, or branch protection blocking the archive commit to main."
+          existing=$(gh issue list --label linkedin-agent-alert --state open \
+            --search "LinkedIn publish failed in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "LinkedIn publish failed" \
+              --label linkedin-agent-alert --body "$body"
+          fi
